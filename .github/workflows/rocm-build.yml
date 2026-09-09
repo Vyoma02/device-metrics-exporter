@@ -1,7 +1,7 @@
 name: DME Build
 
 # Builds DME + test-runner images, .deb packages, and Helm chart against a ROCm tarball.
-# Job graph: resolve → build-dme + build-test-runner + build-helm → publish → validate → results
+# Job graph: read-version → resolve (shared) → build-dme + build-test-runner + build-helm → publish (shared) → validate (shared) → results
 # Triggers: nightly (cron), PR (path-filtered), pre-release (workflow_dispatch)
 
 on:
@@ -39,149 +39,52 @@ on:
         type: boolean
         default: false
 
-
 concurrency:
   group: ${{ github.event_name == 'schedule' && 'dme-nightly' || github.event_name == 'pull_request' && format('dme-pr-{0}', github.event.pull_request.number) || format('dme-{0}-{1}', github.event_name, github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'schedule' || github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
-  id-token: write   # OIDC → AWS
-  actions:  write   # GHA artifact upload/download
+  id-token: write
+  actions: write
 
 env:
   DEV_IMAGE_TAG: docker.io/rocm/device-metrics-exporter-build:v1.10
-  WORKSPACE:     /usr/src/github.com/ROCm/device-metrics-exporter
-  S3_BUCKET:     ${{ vars.THEROCK_BUCKET_NAME }}
+  WORKSPACE: /usr/src/github.com/ROCm/device-metrics-exporter
 
 jobs:
 
-  # Detects trigger mode and resolves tarball URL, image tag, S3 prefix, and DME version.
-  # Reads ROCM_TARBALL_URL and PROJECT_VERSION directly from the Makefile to stay in sync.
-  resolve:
-    name: Resolve tarball + image tag
+  read-version:
+    name: Read version from Makefile
     runs-on: ubuntu-24.04
     outputs:
-      rocm_tarball_url: ${{ steps.resolve.outputs.rocm_tarball_url }}
-      image_tag:        ${{ steps.resolve.outputs.image_tag }}
-      s3_prefix:        ${{ steps.resolve.outputs.s3_prefix }}
-      dme_version:      ${{ steps.resolve.outputs.dme_version }}
-      suffix:           ${{ steps.resolve.outputs.suffix }}
-      scenario:         ${{ steps.resolve.outputs.scenario }}
-      build_needed:     ${{ steps.dedup.outputs.cache-hit != 'true' || inputs.force_rebuild == true }}
+      version: ${{ steps.v.outputs.version }}
+      tarball_url: ${{ steps.v.outputs.tarball_url }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials for dispatch counter
-        if: github.event_name == 'workflow_dispatch'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.ROCK_CI_S3_SECRET }}
-          aws-region: us-east-1
-
-      - name: Resolve trigger inputs
-        id: resolve
-        env:
-          INPUT_URL:       ${{ inputs.rocm_tarball_url }}
-          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+      - uses: actions/checkout@v4
+      - id: v
         run: |
-          set -euo pipefail
+          echo "version=$(grep -m1 'PROJECT_VERSION ?=' Makefile | awk '{print $NF}')" >> "$GITHUB_OUTPUT"
+          echo "tarball_url=$(grep -m1 'ROCM_TARBALL_URL ?=' Makefile | awk '{print $NF}')" >> "$GITHUB_OUTPUT"
 
-          NIGHTLY_CDN_BASE="https://nightly.repo.amd.com/rocm/core/tarball"
-          PR_FALLBACK_URL=$(grep -m1 'ROCM_TARBALL_URL ?=' Makefile | awk '{print $NF}')
-          DME_VERSION=$(grep -m1 'PROJECT_VERSION ?=' Makefile | awk '{print $NF}')
+  resolve:
+    name: Resolve
+    needs: read-version
+    uses: ROCm/common-infra-operator/.github/workflows/rocm-resolve.yml@main
+    with:
+      component: dme
+      version: ${{ needs.read-version.outputs.version }}
+      tarball_url_default: ${{ needs.read-version.outputs.tarball_url }}
+      s3_component_prefix: device-metrics-exporter
+      s3_bucket: ${{ vars.THEROCK_BUCKET_NAME }}
+      trigger_event: ${{ github.event_name }}
+      trigger_sha: ${{ github.sha }}
+      input_tarball_url: ${{ inputs.rocm_tarball_url }}
+      input_image_tag: ${{ inputs.image_tag }}
+      force_rebuild: ${{ inputs.force_rebuild || false }}
+    secrets:
+      ROCK_CI_S3_SECRET: ${{ secrets.ROCK_CI_S3_SECRET }}
 
-          case "${GITHUB_EVENT_NAME}" in
-
-            schedule)
-              # Pick the latest nightly tarball from the CDN index by date suffix
-              TARBALL_NAME=$(
-                curl -fsSL "${NIGHTLY_CDN_BASE}/" 2>/dev/null \
-                  | grep -oP 'therock-dist-linux-multiarch-\d+\.\d+\.\d+a\d{8}\.tar\.gz' \
-                  | sed 's/.*a\([0-9]\{8\}\)\.tar\.gz/\1 &/' \
-                  | sort -rn \
-                  | awk 'NR==1{print $2}'
-              )
-              if [ -z "${TARBALL_NAME}" ]; then
-                echo "::error::Could not detect latest nightly tarball from CDN index"
-                exit 1
-              fi
-              TARBALL_URL="${NIGHTLY_CDN_BASE}/${TARBALL_NAME}"
-              IMAGE_TAG=$(echo "${TARBALL_NAME}" \
-                | sed 's/therock-dist-linux-multiarch-//;s/\.tar\.gz//')
-              DATE=$(echo "${IMAGE_TAG}" | grep -oP '(?<=a)\d{8}')
-              SUFFIX="${IMAGE_TAG}"
-              S3_PREFIX="device-metrics-exporter/nightly/${DATE}"
-              SCENARIO="nightly"
-              ;;
-
-            pull_request)
-              TARBALL_URL="${INPUT_URL:-${PR_FALLBACK_URL}}"
-              IMAGE_TAG="${DME_VERSION}"
-              SUFFIX=$(echo "${GITHUB_SHA}" | cut -c1-8)
-              S3_PREFIX=""
-              SCENARIO="pull_request"
-              ;;
-
-            workflow_dispatch)
-              TARBALL_URL="${INPUT_URL:-${PR_FALLBACK_URL}}"
-              BASENAME=$(basename "${TARBALL_URL}" .tar.gz)
-              IMAGE_TAG="${INPUT_IMAGE_TAG:-${BASENAME#therock-dist-linux-multiarch-}}"
-              # Next sequential build number: list existing S3 prefixes, find highest N, use N+1
-              if ! LISTING=$(aws s3 ls "s3://${S3_BUCKET}/device-metrics-exporter/pre-release/" 2>&1); then
-                echo "::error::Failed to query S3 for build counter: ${LISTING}"
-                exit 1
-              fi
-              LAST_N=$(echo "${LISTING}" | grep -oP "${DME_VERSION}-\K\d+" | sort -n | tail -1 || true)
-              SUFFIX=$(( ${LAST_N:-0} + 1 ))
-              S3_PREFIX="device-metrics-exporter/pre-release/${DME_VERSION}-${SUFFIX}"
-              SCENARIO="pre-release"
-              ;;
-
-            *)
-              echo "::error::Unknown event: ${GITHUB_EVENT_NAME}"
-              exit 1
-              ;;
-          esac
-
-          for var in TARBALL_URL IMAGE_TAG DME_VERSION; do
-            [ -z "${!var}" ] && echo "::error::${var} is empty" && exit 1
-          done
-
-          echo "rocm_tarball_url=${TARBALL_URL}" >> "$GITHUB_OUTPUT"
-          echo "image_tag=${IMAGE_TAG}"           >> "$GITHUB_OUTPUT"
-          echo "s3_prefix=${S3_PREFIX}"           >> "$GITHUB_OUTPUT"
-          echo "dme_version=${DME_VERSION}"       >> "$GITHUB_OUTPUT"
-          echo "suffix=${SUFFIX}"                 >> "$GITHUB_OUTPUT"
-          echo "scenario=${SCENARIO}"             >> "$GITHUB_OUTPUT"
-
-          echo "ROCm tarball : ${TARBALL_URL}"
-          echo "Image tag    : ${IMAGE_TAG}"
-          echo "Suffix       : ${SUFFIX}"
-          echo "Scenario     : ${SCENARIO}"
-          echo "S3 prefix    : ${S3_PREFIX}"
-          echo "DME version  : ${DME_VERSION}"
-
-      - name: Check dedup cache
-        id: dedup
-        if: github.event_name != 'pull_request'
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          key: dedup-dme-${{ steps.resolve.outputs.image_tag }}-${{ github.sha }}
-          path: .dedup-marker
-          lookup-only: true
-
-      - name: Dedup summary
-        if: steps.dedup.outputs.cache-hit == 'true' && inputs.force_rebuild != true
-        run: |
-          {
-            echo "## DME Build — Skipped"
-            echo "Build already succeeded for tag \`${{ steps.resolve.outputs.image_tag }}\` at SHA \`${GITHUB_SHA}\`. No rebuild needed."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # Builds DME exporter image, SR-IOV image, and .deb packages.
   build-dme:
     name: Build DME
     needs: resolve
@@ -193,23 +96,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Free up runner disk space
-        run: |
-          echo "Disk before cleanup:"
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
-            "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
-          sudo rm -rf \
-            /usr/share/swift /usr/local/share/powershell /usr/lib/mono \
-            /usr/local/julia* /opt/az /usr/share/google-cloud-sdk \
-            /usr/lib/jvm /usr/local/share/chromium /usr/share/miniconda || true
-          sudo apt-get remove -y 'llvm-*' 'clang-*' 'mono-*' \
-            azure-cli google-cloud-cli 2>/dev/null || true
-          sudo apt-get autoremove -y || true
-          sudo apt-get clean || true
-          sudo docker image prune --all --force || true
-          echo "Disk after cleanup:"
-          df -h /
+        uses: ROCm/common-infra-operator/.github/actions/free-disk-space@main
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -225,7 +112,7 @@ jobs:
 
       - name: Build DME artifacts inside dev container
         env:
-          IMAGE_TAG:        ${{ needs.resolve.outputs.image_tag }}
+          IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
           ROCM_TARBALL_URL: ${{ needs.resolve.outputs.rocm_tarball_url }}
         run: |
           docker run --rm --privileged \
@@ -243,22 +130,44 @@ jobs:
               git config --global --add safe.directory ${WORKSPACE} && \
               make docker TOP_DIR=${WORKSPACE}"
 
-      - name: Upload DME artifacts
+      - name: Rename and stage artifacts with final names
         env:
           IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
+          DME_VERSION: ${{ needs.resolve.outputs.version }}
+          SUFFIX: ${{ needs.resolve.outputs.suffix }}
         run: |
+          set -euo pipefail
           mkdir -p staging
-          cp "docker/device-metrics-exporter-${IMAGE_TAG}.tar.gz" staging/
-          cp "docker/device-metrics-exporter-sriov-${IMAGE_TAG}.tar.gz" staging/ 2>/dev/null || true
-          cp bin/amdgpu-exporter_*.deb staging/
-          cp bin/amdgpu-exporter-sriov_*.deb staging/ 2>/dev/null || true
+
+          mv "docker/device-metrics-exporter-${IMAGE_TAG}.tar.gz" \
+             "staging/device-metrics-exporter-${DME_VERSION}-${SUFFIX}.tar.gz"
+
+          if [ -f "docker/device-metrics-exporter-sriov-${IMAGE_TAG}.tar.gz" ]; then
+            mv "docker/device-metrics-exporter-sriov-${IMAGE_TAG}.tar.gz" \
+               "staging/device-metrics-exporter-sriov-${DME_VERSION}-${SUFFIX}.tar.gz"
+          fi
+
+          for f in bin/amdgpu-exporter_*_amd64.deb; do
+            [ -f "${f}" ] || continue
+            UBUNTU_VER=$(basename "$f" | grep -oP '\d+\.\d+(?=_amd64)')
+            mv "$f" "staging/amdgpu-exporter-${DME_VERSION}-${SUFFIX}~${UBUNTU_VER}_amd64.deb"
+          done
+
+          for f in bin/amdgpu-exporter-sriov_*_amd64.deb; do
+            [ -f "${f}" ] || continue
+            UBUNTU_VER=$(basename "$f" | grep -oP '\d+\.\d+(?=_amd64)')
+            mv "$f" "staging/amdgpu-exporter-sriov-${DME_VERSION}-${SUFFIX}~${UBUNTU_VER}_amd64.deb"
+          done
+
+          echo "Staged artifacts:"
+          ls -lh staging/
+
       - uses: actions/upload-artifact@v4
         with:
           name: build-dme-${{ needs.resolve.outputs.image_tag }}
           retention-days: 1
           path: staging/
 
-  # Builds test-runner image in parallel with DME.
   build-test-runner:
     name: Build Test Runner
     needs: resolve
@@ -270,23 +179,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Free up runner disk space
-        run: |
-          echo "Disk before cleanup:"
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
-            "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
-          sudo rm -rf \
-            /usr/share/swift /usr/local/share/powershell /usr/lib/mono \
-            /usr/local/julia* /opt/az /usr/share/google-cloud-sdk \
-            /usr/lib/jvm /usr/local/share/chromium /usr/share/miniconda || true
-          sudo apt-get remove -y 'llvm-*' 'clang-*' 'mono-*' \
-            azure-cli google-cloud-cli 2>/dev/null || true
-          sudo apt-get autoremove -y || true
-          sudo apt-get clean || true
-          sudo docker image prune --all --force || true
-          echo "Disk after cleanup:"
-          df -h /
+        uses: ROCm/common-infra-operator/.github/actions/free-disk-space@main
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -302,7 +195,7 @@ jobs:
 
       - name: Build test-runner inside dev container
         env:
-          IMAGE_TAG:        ${{ needs.resolve.outputs.image_tag }}
+          IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
           ROCM_TARBALL_URL: ${{ needs.resolve.outputs.rocm_tarball_url }}
         run: |
           docker run --rm --privileged \
@@ -320,20 +213,22 @@ jobs:
               git config --global --add safe.directory ${WORKSPACE} && \
               make docker-test-runner-cicd TOP_DIR=${WORKSPACE}"
 
-      - name: Upload test-runner artifact
+      - name: Rename and stage artifact with final name
         env:
           IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
+          DME_VERSION: ${{ needs.resolve.outputs.version }}
+          SUFFIX: ${{ needs.resolve.outputs.suffix }}
         run: |
           mkdir -p staging
-          cp "docker/testrunner/test-runner-${IMAGE_TAG}.tar.gz" staging/
+          mv "docker/testrunner/test-runner-${IMAGE_TAG}.tar.gz" \
+             "staging/test-runner-${DME_VERSION}-${SUFFIX}.tar.gz"
+
       - uses: actions/upload-artifact@v4
         with:
           name: build-test-runner-${{ needs.resolve.outputs.image_tag }}
           retention-days: 1
           path: staging/
 
-
-  # Packages the Helm chart — lightweight, no ROCm tarball or dev container needed.
   build-helm:
     name: Build Helm Chart
     needs: resolve
@@ -347,227 +242,71 @@ jobs:
       - name: Install tooling
         run: |
           set -euo pipefail
-          # yq
           curl -fsSL "https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64" \
             -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
-          # helm
           curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
           helm version && yq --version
 
-      - name: Build Helm chart
+      - name: Build and rename Helm chart with final name
         env:
-          DME_VERSION: ${{ needs.resolve.outputs.dme_version }}
-          IMAGE_TAG:   ${{ needs.resolve.outputs.image_tag }}
+          DME_VERSION: ${{ needs.resolve.outputs.version }}
+          IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
+          SUFFIX: ${{ needs.resolve.outputs.suffix }}
         run: |
           set -euo pipefail
           make helm HELM_CHARTS_VERSION="${DME_VERSION}" \
                     HELM_EXPORTER_IMAGE_TAG="${IMAGE_TAG}"
-
-      - name: Upload Helm chart artifact
-        env:
-          DME_VERSION: ${{ needs.resolve.outputs.dme_version }}
-        run: |
           mkdir -p staging
-          cp "helm-charts/device-metrics-exporter-charts-${DME_VERSION}.tgz" staging/
+          mv "helm-charts/device-metrics-exporter-charts-${DME_VERSION}.tgz" \
+             "staging/device-metrics-exporter-charts-${DME_VERSION}-${SUFFIX}.tgz"
+
       - uses: actions/upload-artifact@v4
         with:
           name: build-helm-${{ needs.resolve.outputs.image_tag }}
           retention-days: 1
           path: staging/
 
-
-  # Downloads build artifacts, renames with dme-version + identifier, uploads to S3 and Docker Hub.
   publish:
     name: Publish
     needs: [resolve, build-dme, build-test-runner, build-helm]
-    if: always() && needs.resolve.outputs.build_needed == 'true' && github.event_name != 'pull_request' && needs.build-dme.result == 'success' && needs.build-test-runner.result == 'success' && needs.build-helm.result == 'success'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - name: Download DME artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-dme-${{ needs.resolve.outputs.image_tag }}
-          path: artifacts
+    if: >-
+      always() && needs.resolve.outputs.build_needed == 'true'
+      && github.event_name != 'pull_request'
+      && needs.build-dme.result == 'success'
+      && needs.build-test-runner.result == 'success'
+      && needs.build-helm.result == 'success'
+    uses: ROCm/common-infra-operator/.github/workflows/rocm-publish.yml@main
+    with:
+      component: dme
+      image_tag: ${{ needs.resolve.outputs.image_tag }}
+      version: ${{ needs.resolve.outputs.version }}
+      suffix: ${{ needs.resolve.outputs.suffix }}
+      s3_prefix: ${{ needs.resolve.outputs.s3_prefix }}
+      trigger_sha: ${{ github.sha }}
+      s3_bucket: ${{ vars.THEROCK_BUCKET_NAME }}
+      artifact_names: >-
+        build-dme-${{ needs.resolve.outputs.image_tag }},
+        build-test-runner-${{ needs.resolve.outputs.image_tag }},
+        build-helm-${{ needs.resolve.outputs.image_tag }}
+      s3_file_globs: "*.tar.gz,*_amd64.deb,*.tgz"
+      docker_images: |
+        device-metrics-exporter-${{ needs.resolve.outputs.version }}-${{ needs.resolve.outputs.suffix }}.tar.gz|rocm/device-metrics-exporter:${{ needs.resolve.outputs.image_tag }}|amdpsdo/device-metrics-exporter:${{ needs.resolve.outputs.version }}-${{ needs.resolve.outputs.suffix }}|false
+        device-metrics-exporter-sriov-${{ needs.resolve.outputs.version }}-${{ needs.resolve.outputs.suffix }}.tar.gz|rocm/device-metrics-exporter-sriov:${{ needs.resolve.outputs.image_tag }}|amdpsdo/device-metrics-exporter-sriov:${{ needs.resolve.outputs.version }}-${{ needs.resolve.outputs.suffix }}|true
+        test-runner-${{ needs.resolve.outputs.version }}-${{ needs.resolve.outputs.suffix }}.tar.gz|rocm/test-runner:${{ needs.resolve.outputs.image_tag }}|amdpsdo/test-runner:${{ needs.resolve.outputs.version }}-${{ needs.resolve.outputs.suffix }}|false
+    secrets:
+      ROCK_CI_S3_SECRET: ${{ secrets.ROCK_CI_S3_SECRET }}
+      DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
+      DOCKER_USERNAME: ${{ vars.DOCKER_USERNAME }}
 
-      - name: Download test-runner artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: build-test-runner-${{ needs.resolve.outputs.image_tag }}
-          path: artifacts
-
-      - name: Download Helm chart artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: build-helm-${{ needs.resolve.outputs.image_tag }}
-          path: artifacts
-
-      - name: Rename artifacts with dme-version + identifier
-        env:
-          IMAGE_TAG:   ${{ needs.resolve.outputs.image_tag }}
-          DME_VERSION: ${{ needs.resolve.outputs.dme_version }}
-          SUFFIX:      ${{ needs.resolve.outputs.suffix }}
-        run: |
-          set -euo pipefail
-          mv "artifacts/device-metrics-exporter-${IMAGE_TAG}.tar.gz" \
-             "artifacts/device-metrics-exporter-${DME_VERSION}-${SUFFIX}.tar.gz"
-          # SR-IOV image
-          if [ -f "artifacts/device-metrics-exporter-sriov-${IMAGE_TAG}.tar.gz" ]; then
-            mv "artifacts/device-metrics-exporter-sriov-${IMAGE_TAG}.tar.gz" \
-               "artifacts/device-metrics-exporter-sriov-${DME_VERSION}-${SUFFIX}.tar.gz"
-          fi
-          mv "artifacts/test-runner-${IMAGE_TAG}.tar.gz" \
-             "artifacts/test-runner-${DME_VERSION}-${SUFFIX}.tar.gz"
-          for f in artifacts/amdgpu-exporter_*_amd64.deb; do
-            [ -f "${f}" ] || continue
-            UBUNTU_VER=$(basename "$f" | grep -oP '\d+\.\d+(?=_amd64)')
-            mv "$f" "artifacts/amdgpu-exporter-${DME_VERSION}-${SUFFIX}~${UBUNTU_VER}_amd64.deb"
-          done
-          for f in artifacts/amdgpu-exporter-sriov_*_amd64.deb; do
-            [ -f "${f}" ] || continue
-            UBUNTU_VER=$(basename "$f" | grep -oP '\d+\.\d+(?=_amd64)')
-            mv "$f" "artifacts/amdgpu-exporter-sriov-${DME_VERSION}-${SUFFIX}~${UBUNTU_VER}_amd64.deb"
-          done
-          # Helm chart
-          mv "artifacts/device-metrics-exporter-charts-${DME_VERSION}.tgz" \
-             "artifacts/device-metrics-exporter-charts-${DME_VERSION}-${SUFFIX}.tgz"
-          echo "Renamed artifacts:"
-          ls artifacts/
-
-      - name: Validate upload prerequisites
-        env:
-          HAS_ARN: ${{ secrets.ROCK_CI_S3_SECRET != '' }}
-        run: |
-          if [ "${HAS_ARN}" != "true" ]; then
-            echo "::error::ROCK_CI_S3_SECRET secret is not set"
-            exit 1
-          fi
-          if [ -z "${S3_BUCKET}" ]; then
-            echo "::error::THEROCK_BUCKET_NAME variable is not set"
-            exit 1
-          fi
-
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.ROCK_CI_S3_SECRET }}
-          aws-region: us-east-1
-
-      - name: Upload artifacts to S3
-        id: s3-upload
-        env:
-          S3_PREFIX: ${{ needs.resolve.outputs.s3_prefix }}
-        run: |
-          set -euo pipefail
-
-          upload_file() {
-            local src="$1" dest="$2"
-            if [ ! -f "${src}" ]; then
-              echo "::error::Artifact not found: ${src}"
-              exit 1
-            fi
-            echo "Uploading: ${src} → s3://${S3_BUCKET}/${dest}"
-            aws s3 cp "${src}" "s3://${S3_BUCKET}/${dest}" --no-progress
-          }
-
-          # Upload all artifacts flat into the S3 prefix folder
-          shopt -s nullglob
-          for f in artifacts/device-metrics-exporter-*.tar.gz \
-                   artifacts/test-runner-*.tar.gz \
-                   artifacts/amdgpu-exporter-*_amd64.deb \
-                   artifacts/device-metrics-exporter-charts-*.tgz; do
-            upload_file "${f}" "${S3_PREFIX}/$(basename "${f}")"
-          done
-          shopt -u nullglob
-
-          echo "All artifacts uploaded to s3://${S3_BUCKET}/${S3_PREFIX}/"
-          aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/" --human-readable || true
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ vars.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_TOKEN }}
-
-      - name: Push images to amdpsdo registry
-        id: registry-push
-        env:
-          IMAGE_TAG:   ${{ needs.resolve.outputs.image_tag }}
-          DME_VERSION: ${{ needs.resolve.outputs.dme_version }}
-          SUFFIX:      ${{ needs.resolve.outputs.suffix }}
-        run: |
-          set -euo pipefail
-          PUSH_TAG="${DME_VERSION}-${SUFFIX}"
-
-          docker load < "artifacts/device-metrics-exporter-${PUSH_TAG}.tar.gz"
-          docker tag "docker.io/rocm/device-metrics-exporter:${IMAGE_TAG}" \
-                     "docker.io/amdpsdo/device-metrics-exporter:${PUSH_TAG}"
-          docker push "docker.io/amdpsdo/device-metrics-exporter:${PUSH_TAG}"
-
-          # SR-IOV image
-          SRIOV_FILE="artifacts/device-metrics-exporter-sriov-${PUSH_TAG}.tar.gz"
-          if [ -f "${SRIOV_FILE}" ]; then
-            docker load < "${SRIOV_FILE}"
-            docker tag "docker.io/rocm/device-metrics-exporter-sriov:${IMAGE_TAG}" \
-                       "docker.io/amdpsdo/device-metrics-exporter-sriov:${PUSH_TAG}"
-            docker push "docker.io/amdpsdo/device-metrics-exporter-sriov:${PUSH_TAG}"
-            echo "Pushed docker.io/amdpsdo/device-metrics-exporter-sriov:${PUSH_TAG}"
-          fi
-
-          docker load < "artifacts/test-runner-${PUSH_TAG}.tar.gz"
-          docker tag "docker.io/rocm/test-runner:${IMAGE_TAG}" \
-                     "docker.io/amdpsdo/test-runner:${PUSH_TAG}"
-          docker push "docker.io/amdpsdo/test-runner:${PUSH_TAG}"
-
-          echo "Pushed docker.io/amdpsdo/device-metrics-exporter:${PUSH_TAG}"
-          echo "Pushed docker.io/amdpsdo/test-runner:${PUSH_TAG}"
-
-      - name: Create dedup marker
-        if: ${{ always() && steps.s3-upload.outcome == 'success' && steps.registry-push.outcome == 'success' }}
-        run: mkdir -p .dedup-marker && echo "ok" > .dedup-marker/ok
-      - name: Save dedup marker to cache
-        uses: actions/cache/save@v4
-        if: ${{ always() && steps.s3-upload.outcome == 'success' && steps.registry-push.outcome == 'success' }}
-        continue-on-error: true
-        with:
-          key: dedup-dme-${{ needs.resolve.outputs.image_tag }}-${{ github.sha }}
-          path: .dedup-marker
-
-      - name: Generate build summary
-        if: always()
-        env:
-          IMAGE_TAG:        ${{ needs.resolve.outputs.image_tag }}
-          ROCM_TARBALL_URL: ${{ needs.resolve.outputs.rocm_tarball_url }}
-          S3_PREFIX:        ${{ needs.resolve.outputs.s3_prefix }}
-          DME_BUILD_RESULT:  ${{ needs.build-dme.result }}
-          TR_BUILD_RESULT:   ${{ needs.build-test-runner.result }}
-          HELM_BUILD_RESULT: ${{ needs.build-helm.result }}
-          S3_RESULT:         ${{ steps.s3-upload.outcome }}
-          REGISTRY_RESULT:   ${{ steps.registry-push.outcome }}
-        run: |
-          {
-            echo "## DME Build — \`${IMAGE_TAG}\`"
-            echo ""
-            echo "| | |"
-            echo "|---|---|"
-            echo "| Trigger | \`${{ github.event_name }}\` |"
-            echo "| ROCm tarball | \`${ROCM_TARBALL_URL}\` |"
-            echo "| Image tag | \`${IMAGE_TAG}\` |"
-            echo "| Artifact suffix | \`${{ needs.resolve.outputs.suffix }}\` |"
-            echo "| Build DME | ${DME_BUILD_RESULT} |"
-            echo "| Build Test Runner | ${TR_BUILD_RESULT} |"
-            echo "| Build Helm Chart | ${HELM_BUILD_RESULT} |"
-            echo "| S3 upload | ${S3_RESULT:-failure} |"
-            echo "| Registry push | ${REGISTRY_RESULT:-skipped} |"
-            echo "| S3 prefix | \`s3://${S3_BUCKET}/${S3_PREFIX}/\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # Calls the orchestrator in common-infra-operator to run validation.
-  # Synchronous — this workflow waits for validation to complete.
   validate:
     name: Validate
     needs: [resolve, build-dme, build-test-runner, build-helm, publish]
-    if: always() && needs.resolve.outputs.build_needed == 'true' && needs.build-dme.result == 'success' && needs.build-test-runner.result == 'success' && needs.build-helm.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    if: >-
+      always() && needs.resolve.outputs.build_needed == 'true'
+      && needs.build-dme.result == 'success'
+      && needs.build-test-runner.result == 'success'
+      && needs.build-helm.result == 'success'
+      && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
     uses: ROCm/common-infra-operator/.github/workflows/rocm-orchestrator.yml@main
     with:
       component: dme
@@ -575,32 +314,67 @@ jobs:
       s3_prefix: ${{ needs.resolve.outputs.s3_prefix }}
 
   results:
-    name: Validation results
-    needs: [resolve, validate]
-    if: always() && needs.validate.result != 'skipped'
+    name: Results
+    needs: [resolve, build-dme, build-test-runner, build-helm, publish, validate]
+    if: always() && needs.resolve.outputs.build_needed == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - name: Post validation summary
+      - name: Determine overall status
+        id: status
         env:
-          VALIDATE_JOB:    ${{ needs.validate.result }}
+          DME_RESULT: ${{ needs.build-dme.result }}
+          TR_RESULT: ${{ needs.build-test-runner.result }}
+          HELM_RESULT: ${{ needs.build-helm.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          VALIDATE_JOB: ${{ needs.validate.result }}
           VALIDATE_OUTPUT: ${{ needs.validate.outputs.result }}
         run: |
-          if [ "${VALIDATE_JOB}" = "success" ] && [ "${VALIDATE_OUTPUT}" = "pass" ]; then
+          if [ "${DME_RESULT}" != "success" ]; then
+            STATUS="DME_BUILD_FAILED"
+          elif [ "${TR_RESULT}" != "success" ]; then
+            STATUS="TEST_RUNNER_BUILD_FAILED"
+          elif [ "${HELM_RESULT}" != "success" ]; then
+            STATUS="HELM_BUILD_FAILED"
+          elif [ "${PUBLISH_RESULT}" != "success" ] && [ "${PUBLISH_RESULT}" != "skipped" ]; then
+            STATUS="PUBLISH_FAILED"
+          elif [ "${VALIDATE_JOB}" = "success" ] && [ "${VALIDATE_OUTPUT}" = "pass" ]; then
             STATUS="PASSED"
           elif [ "${VALIDATE_JOB}" = "success" ]; then
-            STATUS="FAILED — ${VALIDATE_OUTPUT}"
+            STATUS="FAILED"
           elif [ "${VALIDATE_JOB}" = "cancelled" ]; then
-            STATUS="CANCELLED — orchestrator was cancelled before completing"
+            STATUS="CANCELLED"
           else
-            STATUS="ERROR — orchestrator job failed (timeout, crash, or misconfiguration)"
+            STATUS="ERROR"
           fi
+          echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
 
+      - name: Post summary
+        env:
+          STATUS: ${{ steps.status.outputs.status }}
+          IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
+          SCENARIO: ${{ needs.resolve.outputs.scenario }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          SUFFIX: ${{ needs.resolve.outputs.suffix }}
+          DME_RESULT: ${{ needs.build-dme.result }}
+          TR_RESULT: ${{ needs.build-test-runner.result }}
+          HELM_RESULT: ${{ needs.build-helm.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          VALIDATE_OUTPUT: ${{ needs.validate.outputs.result }}
+        run: |
           {
-            echo "## Validation — \`${{ needs.resolve.outputs.scenario }}\`"
+            echo "## DME Build Results — \`${SCENARIO}\`"
             echo ""
             echo "| | |"
             echo "|---|---|"
-            echo "| Status | ${STATUS} |"
-            echo "| Orchestrator job | ${VALIDATE_JOB} |"
-            echo "| Orchestrator output | ${VALIDATE_OUTPUT:-n/a} |"
+            echo "| Overall | **${STATUS}** |"
+            echo "| Image tag | \`${IMAGE_TAG}\` |"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Suffix | \`${SUFFIX}\` |"
+            echo "| Build DME | ${DME_RESULT} |"
+            echo "| Build Test Runner | ${TR_RESULT} |"
+            echo "| Build Helm | ${HELM_RESULT} |"
+            echo "| Publish | ${PUBLISH_RESULT} |"
+            echo "| Validate (job) | ${VALIDATE_RESULT} |"
+            echo "| Validate (output) | ${VALIDATE_OUTPUT:-n/a} |"
           } >> "$GITHUB_STEP_SUMMARY"
