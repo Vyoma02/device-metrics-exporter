@@ -139,24 +139,24 @@ jobs:
           set -euo pipefail
           mkdir -p staging
 
-          mv "docker/device-metrics-exporter-${IMAGE_TAG}.tar.gz" \
+          cp "docker/device-metrics-exporter-${IMAGE_TAG}.tar.gz" \
              "staging/device-metrics-exporter-${DME_VERSION}-${SUFFIX}.tar.gz"
 
           if [ -f "docker/device-metrics-exporter-sriov-${IMAGE_TAG}.tar.gz" ]; then
-            mv "docker/device-metrics-exporter-sriov-${IMAGE_TAG}.tar.gz" \
+            cp "docker/device-metrics-exporter-sriov-${IMAGE_TAG}.tar.gz" \
                "staging/device-metrics-exporter-sriov-${DME_VERSION}-${SUFFIX}.tar.gz"
           fi
 
           for f in bin/amdgpu-exporter_*_amd64.deb; do
             [ -f "${f}" ] || continue
             UBUNTU_VER=$(basename "$f" | grep -oP '\d+\.\d+(?=_amd64)')
-            mv "$f" "staging/amdgpu-exporter-${DME_VERSION}-${SUFFIX}~${UBUNTU_VER}_amd64.deb"
+            cp "$f" "staging/amdgpu-exporter-${DME_VERSION}-${SUFFIX}~${UBUNTU_VER}_amd64.deb"
           done
 
           for f in bin/amdgpu-exporter-sriov_*_amd64.deb; do
             [ -f "${f}" ] || continue
             UBUNTU_VER=$(basename "$f" | grep -oP '\d+\.\d+(?=_amd64)')
-            mv "$f" "staging/amdgpu-exporter-sriov-${DME_VERSION}-${SUFFIX}~${UBUNTU_VER}_amd64.deb"
+            cp "$f" "staging/amdgpu-exporter-sriov-${DME_VERSION}-${SUFFIX}~${UBUNTU_VER}_amd64.deb"
           done
 
           echo "Staged artifacts:"
